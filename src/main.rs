@@ -1,5 +1,5 @@
 use mempool::Mempool;
-use pallas::ledger::traverse::{tx, MultiEraTx};
+use pallas::ledger::traverse::MultiEraTx;
 use rocket::{launch, post, routes, State};
 use rocket::data::{Data, ToByteUnit};
 use rocket::http::Status;
