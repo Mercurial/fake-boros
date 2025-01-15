@@ -1,4 +1,5 @@
 use mempool::Mempool;
+use pallas::ledger::traverse::{tx, MultiEraTx};
 use rocket::{launch, post, routes, State};
 use rocket::data::{Data, ToByteUnit};
 use rocket::http::Status;
@@ -8,6 +9,7 @@ mod mempool;
 mod tx_submit_peer;
 mod tx_submit_peer_manager;
 
+use tracing::Level;
 
 /// POST endpoint that accepts "application/cbor" data.
 /// Reads the body as raw bytes, then pushes it into our mempool.
@@ -28,27 +30,35 @@ async fn submit_tx(
     // The `bytes.value` is a `Vec<u8>` containing the raw CBOR data.
     let raw_cbor = bytes.value;
 
-    println!("Tx Cbor: {:?}", hex::encode(&raw_cbor));
+    tracing::info!("Tx Cbor: {:?}", hex::encode(&raw_cbor));
+
+    let parsed_tx = MultiEraTx::decode(&raw_cbor).unwrap();
+    let tx_hash = parsed_tx.hash();
 
     // Store the transaction in our mempool.
     // We'll lock the mutex, then push the new transaction.
     tx_submit_peer_manager.add_tx(raw_cbor.clone()).await;
 
-    // // Return how many total transactions are currently in the mempool.
-    // let len = mempool.pending_tx.lock().unwrap().len();
-    Ok(format!(
-        "Received {} bytes of CBOR data. Mempool size is now {}.",
-        raw_cbor.len(),
-        0
-    ))
+    // Return the transaction hash as a response.
+    Ok(hex::encode(tx_hash))
 }
 
 #[launch]
 async fn rocket() -> _ {
+
+    tracing_subscriber::fmt()
+    .with_max_level(Level::INFO)
+    .init();
+
+    tracing::info!("Starting server...");
+
     let mempool = Mempool::new();
 
-    let peer_addr = "preview-node.play.dev.cardano.org:3001";
-    let peer_addresses = vec![peer_addr.to_string()];
+    let peer_addresses = vec![
+        "preview-node.play.dev.cardano.org:3001".to_string(),
+        "adaboy-preview-1c.gleeze.com:5000".to_string(),
+        "testicles.kiwipool.org:9720".to_string()
+    ];
 
     let mut tx_submit_peer_manager = TxSubmitPeerManager::new(2, peer_addresses);
     tx_submit_peer_manager.init().await.unwrap();

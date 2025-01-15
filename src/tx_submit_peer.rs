@@ -8,6 +8,7 @@ use pallas::network::miniprotocols::txsubmission::{EraTxBody, EraTxId, Request};
 use pallas::network::{facades::PeerClient, miniprotocols::txsubmission::TxIdAndSize};
 use tokio::sync::{Mutex, RwLock};
 use tokio::task;
+use tracing::{error, info, warn};
 
 use crate::Mempool;
 
@@ -45,10 +46,16 @@ impl TxSubmitPeer {
         // 1) Connect to the node
         let mut client = PeerClient::connect(&self.peer_addr, self.network_magic)
             .await
-            .unwrap();
+            .map_err(|e| {
+                error!(error=?e, peer=%self.peer_addr, "Failed to connect to peer");
+                e
+            }).unwrap();
 
         // 2) Initialize the txsubmission mini-protocol
-        client.txsubmission().send_init().await.unwrap();
+        client.txsubmission().send_init().await.map_err(|e| {
+            error!(error=?e, peer=%self.peer_addr, "Failed to send init message");
+            e
+        }).unwrap();
 
         // 3) Store it so we can spawn our background loop
         self.client = Arc::new(Mutex::new(Some(client)));
@@ -64,185 +71,224 @@ impl TxSubmitPeer {
     fn start_background_task(&mut self) {
         let client_arc = Arc::clone(&self.client);
         let mempool_arc = Arc::clone(&self.mempool);
-        let unfullfilled_request_arc = Arc::clone(&self.unfulfilled_request);
+        let unfulfilled_request_arc = Arc::clone(&self.unfulfilled_request);
+        let peer_addr = self.peer_addr.clone();
 
         task::spawn(async move {
             loop {
-                async fn process_unfullfilled(
+                // Separate function to handle leftover unfulfilled requests
+                async fn process_unfulfilled(
                     mempool: &Mempool,
                     client: &mut PeerClient,
-                    unfullfilled_request_arc: Arc<RwLock<Option<usize>>>,
+                    unfulfilled_request_arc: Arc<RwLock<Option<usize>>>,
                     request: usize,
+                    peer_addr: &str,
                 ) -> Option<usize> {
                     let available = mempool.pending_total();
 
                     if available > 0 {
-                        println!(
-                            "found enough txs to fulfill request: request={}, available={}",
-                            request, available
-                        );
-
-                        // we have all the tx we need to we process the work unit as a new one. We don't
-                        // acknowledge anything because that already happened on the initial attempt to
-                        // fullfil the request.
-                        reply_txs(mempool, client, unfullfilled_request_arc, 0, request)
+                        info!(peer=%peer_addr, request, available, "Found enough TXs to fulfill request");
+                        reply_txs(mempool, client, unfulfilled_request_arc, 0, request, peer_addr)
                             .await
-                            .unwrap();
+                            .ok();
                         None
                     } else {
-                        println!(
-                            "still not enough txs to fulfill request: request={}, available={}",
-                            request, available
-                        );
-
-                        // we wait a few secs to avoid turning this stage into a hot loop.
-                        // TODO: we need to watch the mempool and abort the wait if there's a change in
-                        // the list of available txs.
-
-                        // Drop the mempool reference to avoid a deadlock.
-                        let _ = mempool;
-                        
+                        info!(peer=%peer_addr, request, available, "Not enough TXs yet; will retry");
                         tokio::time::sleep(Duration::from_secs(10)).await;
-
-                        // we store the request again so that the next schedule know we're still waiting
-                        // for new transactions.
                         Some(request)
                     }
                 }
 
+                // Separate function to reply with TXs
                 async fn reply_txs(
                     mempool: &Mempool,
                     client: &mut PeerClient,
-                    unfullfilled_request_arc: Arc<RwLock<Option<usize>>>,
+                    unfulfilled_request_arc: Arc<RwLock<Option<usize>>>,
                     ack: usize,
                     req: usize,
+                    peer_addr: &str,
                 ) -> Result<(), Error> {
                     mempool.acknowledge(ack);
 
                     let available = mempool.pending_total();
-
                     if available > 0 {
                         let txs = mempool.request(req);
-                        propagate_txs(client, txs).await.unwrap();
-
-                        let mut unfullfilled_request = unfullfilled_request_arc.write().await;
-                        *unfullfilled_request = None;
+                        propagate_txs(client, txs, peer_addr).await?;
+                        let mut unfulfilled = unfulfilled_request_arc.write().await;
+                        *unfulfilled = None;
                     } else {
-                        println!(
-                            "not enough txs to fulfill request: req={}, available={}",
-                            req, available
-                        );
-                        let mut unfullfilled_request = unfullfilled_request_arc.write().await;
-                        *unfullfilled_request = Some(req);
-                        println!("stored unfulfilled request: req={}", req);
+                        info!(peer=%peer_addr, req, available, "Still not enough TXs; storing unfulfilled request");
+                        let mut unfulfilled = unfulfilled_request_arc.write().await;
+                        *unfulfilled = Some(req);
                     }
 
                     Ok(())
                 }
 
-                // Try to read the next request from the tx-submission protocol
-                let mut client = client_arc.lock().await;
-                let client = client.as_mut().unwrap();
+                // Check if there's an unfulfilled request
+                info!(peer=%peer_addr, "Checking for unfulfilled request...");
+                let outstanding_request = {
+                    let read_guard = unfulfilled_request_arc.read().await;
+                    *read_guard
+                };
 
-                println!("Checking for unfulfilled request...");
-
-                let unfullfilled_request = unfullfilled_request_arc.read().await;
-                let unfullfilled_request_clone = *unfullfilled_request;
-                drop(unfullfilled_request);
-
-                match unfullfilled_request_clone {
+                match outstanding_request {
                     Some(request) => {
-                        let mempool = mempool_arc.lock().await;
-                        process_unfullfilled(
-                            &mempool,
-                            client,
-                            Arc::clone(&unfullfilled_request_arc),
-                            request,
-                        )
-                        .await;
-                    }
-                    None => {
-                        println!("Waiting for next request...");
-                        let request = match client.txsubmission().next_request().await {
-                            Ok(r) => r,
-                            Err(e) => {
-                                println!("Error reading request: {:?}", e);
+                        // Handle leftover request
+                        let mempool_guard = mempool_arc.lock().await;
+                        let mut client_guard = client_arc.lock().await;
+                        let client_ref = match client_guard.as_mut() {
+                            Some(c) => c,
+                            None => {
+                                warn!(peer=%peer_addr, "No client available; breaking");
                                 break;
                             }
                         };
 
-                        println!("Received request...");
-
-                        // Pattern-match the request and handle it as needed
-                        match request {
-                            Request::TxIds(ack, req) => {
-                                let ack = ack as usize;
-                                let req = req as usize;
-
-                                println!("blocking tx ids request: req={}, ack={}", req, ack);
-
-                                let mempool = mempool_arc.lock().await;
-                                reply_txs(
-                                    &mempool,
-                                    client,
-                                    Arc::clone(&unfullfilled_request_arc),
-                                    ack,
-                                    req,
-                                )
-                                .await
-                                .unwrap();
-                            }
-                            Request::TxIdsNonBlocking(ack, req) => {
-                                println!("non-blocking tx ids request: req={}, ack={}", req, ack);
-
-                                let mempool = mempool_arc.lock().await;
-                                mempool.acknowledge(ack as usize);
-
-                                let txs = mempool.request(req as usize);
-                                propagate_txs(client, txs).await.unwrap();
-                            }
-                            Request::Txs(ids) => {
-                                println!("tx batch request");
-
-                                let mempool = mempool_arc.lock().await;
-                                let to_send = ids
-                                    .iter()
-                                    // we omit any missing tx, we assume that this would be considered a protocol
-                                    // violation and rejected by the upstream.
-                                    .filter_map(|x| {
-                                        mempool.find_inflight(&Hash::from(x.1.as_slice()))
-                                    })
-                                    .map(|x| EraTxBody(x.era, x.bytes.clone()))
-                                    .collect_vec();
-
-                                let result = client.txsubmission().reply_txs(to_send).await;
-
-                                if let Err(err) = &result {
-                                    println!("error sending txs upstream: {:?}", err);
+                        process_unfulfilled(
+                            &mempool_guard,
+                            client_ref,
+                            Arc::clone(&unfulfilled_request_arc),
+                            request,
+                            &peer_addr,
+                        )
+                        .await;
+                    }
+                    None => {
+                        info!(peer=%peer_addr, "Waiting for next request...");
+                        // We lock only to get the next_request
+                        let next_req = {
+                            let mut client_guard = client_arc.lock().await;
+                            let client_ref = match client_guard.as_mut() {
+                                Some(c) => c,
+                                None => {
+                                    warn!(peer=%peer_addr, "No client available; breaking");
+                                    break;
                                 }
+                            };
+                            client_ref.txsubmission().next_request().await
+                        };
+
+                        let request = match next_req {
+                            Ok(r) => {
+                                info!(peer=%peer_addr, "Received request from node");
+                                r
+                            }
+                            Err(e) => {
+                                error!(peer=%peer_addr, error=?e, "Error reading request; breaking loop");
+                                break;
                             }
                         };
+
+                        // Handle the received request
+                        match request {
+                            Request::TxIds(ack, req) => {
+                                info!(peer=%peer_addr, ack, req, "Blocking TxIds request");
+                                let ack_usize = ack as usize;
+                                let req_usize = req as usize;
+
+                                let mempool_guard = mempool_arc.lock().await;
+                                let mut client_guard = client_arc.lock().await;
+                                let client_ref = match client_guard.as_mut() {
+                                    Some(c) => c,
+                                    None => {
+                                        warn!(peer=%peer_addr, "No client available; breaking");
+                                        break;
+                                    }
+                                };
+
+                                reply_txs(
+                                    &mempool_guard,
+                                    client_ref,
+                                    Arc::clone(&unfulfilled_request_arc),
+                                    ack_usize,
+                                    req_usize,
+                                    &peer_addr,
+                                )
+                                .await
+                                .ok();
+                            }
+                            Request::TxIdsNonBlocking(ack, req) => {
+                                info!(peer=%peer_addr, ack, req, "Non-blocking TxIds request");
+                                let mempool_guard = mempool_arc.lock().await;
+                                mempool_guard.acknowledge(ack as usize);
+
+                                let txs = mempool_guard.request(req as usize);
+                                drop(mempool_guard); // drop before I/O
+
+                                let mut client_guard = client_arc.lock().await;
+                                let client_ref = match client_guard.as_mut() {
+                                    Some(c) => c,
+                                    None => {
+                                        warn!(peer=%peer_addr, "No client available; breaking");
+                                        break;
+                                    }
+                                };
+                                propagate_txs(client_ref, txs, &peer_addr).await.ok();
+                            }
+                            Request::Txs(ids) => {
+                                // Collect the Ids hash and log them
+                                let ids: Vec<_> = ids.iter().map(|x| (x.0, x.1.clone())).collect();
+
+                                info!(peer=%peer_addr, ids=%ids.iter().map(|x| hex::encode(&x.1)).join(", "), "Tx batch request");
+
+                                let to_send = {
+                                    let mempool_guard = mempool_arc.lock().await;
+                                    ids.iter()
+                                        .filter_map(|x| {
+                                            mempool_guard.find_inflight(&Hash::from(x.1.as_slice()))
+                                        })
+                                        .map(|x| EraTxBody(x.era, x.bytes.clone()))
+                                        .collect_vec()
+                                };
+
+                                // Log the number of TXs we're sending
+                                info!(peer=%peer_addr, count=to_send.len(), "Sending TXs upstream");
+
+                                let mut client_guard = client_arc.lock().await;
+                                let client_ref = match client_guard.as_mut() {
+                                    Some(c) => c,
+                                    None => {
+                                        warn!(peer=%peer_addr, "No client available; breaking");
+                                        break;
+                                    }
+                                };
+
+                                if let Err(err) = client_ref.txsubmission().reply_txs(to_send).await {
+                                    error!(peer=%peer_addr, error=?err, "Error sending TXs upstream");
+                                }
+                            }
+                        }
                     }
                 }
             }
         });
     }
 
+    /// Add a new transaction to the mempool.
     pub async fn add_tx(&self, tx: Vec<u8>) {
         let mempool = self.mempool.lock().await;
         mempool.receive_raw(&tx).unwrap();
     }
 }
 
-async fn propagate_txs(client: &mut PeerClient, txs: Vec<crate::mempool::Tx>) -> Result<(), Error> {
-    println!("propagating tx ids: {}", txs.len());
+/// Propagate TX IDs to the node.
+async fn propagate_txs(
+    client: &mut PeerClient,
+    txs: Vec<crate::mempool::Tx>,
+    peer_addr: &str,
+) -> Result<(), Error> {
+    info!(peer=%peer_addr, count=txs.len(), "Propagating TX IDs");
 
     let payload = txs
         .iter()
         .map(|x| TxIdAndSize(EraTxId(x.era, x.hash.to_vec()), x.bytes.len() as u32))
         .collect_vec();
 
-    client.txsubmission().reply_tx_ids(payload).await.unwrap();
+    client.txsubmission().reply_tx_ids(payload).await.map_err(|e| {
+        error!(peer=%peer_addr, error=?e, "Failed to reply with TX IDs");
+        e
+    }).unwrap();
 
     Ok(())
 }
