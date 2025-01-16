@@ -52,8 +52,6 @@ async fn rocket() -> _ {
 
     tracing::info!("Starting server...");
 
-    let mempool = Mempool::new();
-
     let peer_addresses = vec![
         "preview-node.play.dev.cardano.org:3001".to_string(),
         "adaboy-preview-1c.gleeze.com:5000".to_string(),
@@ -64,7 +62,6 @@ async fn rocket() -> _ {
     tx_submit_peer_manager.init().await.unwrap();
 
     rocket::build()
-        .manage(mempool)
         .manage(tx_submit_peer_manager)
         .mount("/", routes![submit_tx])
 }
